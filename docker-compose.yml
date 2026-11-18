@@ -1,0 +1,24 @@
+services:
+  township-weight-api:
+    build: .
+    image: township-weight-api:1.0.0
+    container_name: township-weight-api
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/weighting.db
+      POSITIVE_AREA_EPS_M2: "1e-6"
+      MAX_WORKERS: "4"
+    volumes:
+      # 命名卷持久化已受理地图，容器重建/重启后数据保留
+      - township_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  township_data:

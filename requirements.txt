@@ -1,0 +1,6 @@
+fastapi==0.164.0
+uvicorn[standard]==0.54.0
+shapely==2.2.0
+pyproj==3.7.2
+python-multipart==0.0.34
+pydantic==2.14.3
