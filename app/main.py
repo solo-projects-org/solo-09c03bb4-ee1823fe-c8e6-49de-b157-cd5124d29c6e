@@ -3,7 +3,7 @@
 端点：
 - GET  /healthz                       健康检查
 - GET  /docs                          Swagger UI（入口）
-- PUT  /api/maps/{version}            按版上传/整版更正 GeoJSON
+- PUT  /api/maps/{version}            按版上传/整版更正 GeoJSON（流式受理）
 - GET  /api/maps                      已受理版本列表（含修订号）
 - GET  /api/maps/{version}            版本元数据
 - POST /api/weights/jobs              提交旧版→新版权重计算任务
@@ -12,17 +12,23 @@
 """
 from __future__ import annotations
 
-import json
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Iterator
 
+import anyio
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from . import geo
-from .db import Database
+from .db import Database, StagingDuplicateError
 from .geo import GeoValidationError
+from .ingest import (
+    StreamingFeatureCollection,
+    StreamingJSONError,
+    async_stream_to_sync_iter,
+    multipart_file_chunks,
+)
 from .jobs import COMPLETED, FAILED, PENDING, RUNNING, STALE, JobError, JobManager
 
 
@@ -82,19 +88,71 @@ def get_jobs(request: Request) -> JobManager:
     return request.app.state.jobs
 
 
-async def _read_geojson_body(request: Request) -> bytes:
-    """同时支持 application/json 原始体与 multipart/form-data 文件上传。"""
+def _request_body_chunks(request: Request) -> Iterator[bytes]:
+    """把请求体（JSON 原始体或 multipart 文件）包装成同步字节迭代器。
+
+    实际拉取发生在工作线程内，通过 anyio 回到事件循环执行 receive，
+    事件循环不被解析占用，其他版本的上传/查询照常服务。
+    """
     content_type = request.headers.get("content-type", "")
     if content_type.startswith("multipart/form-data"):
-        form = await request.form()
-        upload = form.get("file")
-        if upload is None or not hasattr(upload, "read"):
-            raise HTTPException(
-                status_code=400,
-                detail="multipart 上传需提供名为 file 的 GeoJSON 文件字段",
-            )
-        return await upload.read()
-    return await request.body()
+        raw = async_stream_to_sync_iter(request.stream)
+        return multipart_file_chunks(content_type, raw)
+    return async_stream_to_sync_iter(request.stream)
+
+
+def _ingest_stream(
+    db: Database, version: str, chunks: Iterator[bytes]
+) -> tuple[int, int, bool]:
+    """流式受理的同步核心：逐要素解析 -> 校验 -> 暂存 -> 整版发布。
+
+    返回 (revision, feature_count, replaced_previous)。
+    任何语法/校验/暂存/入库失败都抛异常，由端点转成 400；
+    失败时暂存被清理，maps/map_features 从未被修改，旧版保持不动。
+    """
+    staging_id = db.new_staging_id()
+    try:
+        fc = StreamingFeatureCollection(chunks)
+        # 逐要素：解析一个、校验一个；按定长微批暂存，批与批之间引用
+        # 即释放。解析期内存只与“当前要素/当前 token + 一个微批”有关，
+        # 不随要素总数线性增长。
+        fc.start()
+        feature_count = 0
+        pending: list[tuple[int, str, dict]] = []
+        for idx, feature in enumerate(fc.features()):
+            township_id, geom = geo.validate_feature(feature, idx)
+            pending.append((idx, township_id, geo.to_storage_geometry(geom)))
+            feature_count += 1
+            if len(pending) >= db.STAGE_BATCH_SIZE:
+                db.stage_features(staging_id, pending)
+                pending.clear()
+        fc.finish()
+        if pending:
+            db.stage_features(staging_id, pending)
+            pending.clear()
+
+        # 头部字段在读完整个文件后再校验（crs 等），拒收同样不改旧版
+        geo.validate_crs(fc.header)
+        if fc.header.get("type") != "FeatureCollection":
+            raise GeoValidationError("仅支持 GeoJSON FeatureCollection")
+        if feature_count == 0:
+            raise GeoValidationError("features 为空，至少需要一个面要素")
+
+        replaced = db.get_revision(version) is not None
+        revision = db.publish_staging(version, staging_id)
+        return revision, feature_count, replaced
+    except StagingDuplicateError as exc:
+        # 暂存唯一约束 -> 与旧实现一致的 400 文案
+        db.discard_staging(staging_id)
+        raise GeoValidationError(str(exc)) from exc
+    except (GeoValidationError, StreamingJSONError):
+        # 语义化拒收：不包装、不加前缀，由端点映射为对应 400 文案
+        db.discard_staging(staging_id)
+        raise
+    except Exception:
+        # 入库等基础设施失败：清理暂存后上抛，端点回 500，旧版不变
+        db.discard_staging(staging_id)
+        raise
 
 
 # ----------------------------------------------------------------------
@@ -118,36 +176,41 @@ def healthz(request: Request):
     response_model=MapUploadResponse,
     tags=["maps"],
     status_code=status.HTTP_200_OK,
-    summary="按版上传 GeoJSON（同版重传 = 整版更正）",
+    summary="按版上传 GeoJSON（同版重传 = 整版更正，逐要素流式受理）",
 )
 async def upload_map(version: str, request: Request) -> MapUploadResponse:
     if not version or len(version) > 128:
         raise HTTPException(status_code=400, detail="版号不能为空且长度不超过 128")
 
-    raw = await _read_geojson_body(request)
-    if not raw:
-        raise HTTPException(status_code=400, detail="请求体为空，需要 GeoJSON FeatureCollection")
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=400, detail=f"GeoJSON 解析失败：{exc}") from exc
-
-    # 整版校验：任何要素无效/乡镇号重复都会在这里抛错，旧版保持不动
-    try:
-        parsed = geo.parse_feature_collection(payload)
-    except GeoValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     db = get_db(request)
-    replaced = db.get_revision(version) is not None
-    stored = geo.to_storage_geometries(parsed)
-    # 单事务替换，失败回滚，旧版完整保留
-    revision = db.replace_map(version, stored)
+    chunks = _request_body_chunks(request)
+
+    # 重 CPU/IO 的解析放到工作线程：事件循环保持空闲，其他版的上传与
+    # 查询在解析期间仍可被处理。空请求体在词法器 EOF 处即报错。
+    try:
+        revision, feature_count, replaced = await anyio.to_thread.run_sync(
+            _ingest_stream, db, version, chunks
+        )
+    except StreamingJSONError as exc:
+        # 尾部截断、JSON/multipart 语法损坏、空请求体
+        raise HTTPException(status_code=400, detail=f"GeoJSON 解析失败：{exc}") from exc
+    except GeoValidationError as exc:
+        # 字段/几何拒收规则与旧实现完全一致（含重复乡镇号文案）
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # 暂存/入库等基础设施失败：publish_staging 已回滚、暂存已清理，
+        # 旧版与修订号保持不变；以 500 明确告知本次受理未生效。
+        raise HTTPException(
+            status_code=500,
+            detail=f"地图受理失败，整版未发布、旧版保持不变：{type(exc).__name__}: {exc}",
+        ) from exc
 
     return MapUploadResponse(
         version=version,
         revision=revision,
-        feature_count=len(stored),
+        feature_count=feature_count,
         replaced_previous=replaced,
         message=(
             f"版号 {version} 已整版更正（第 {revision} 次受理）"

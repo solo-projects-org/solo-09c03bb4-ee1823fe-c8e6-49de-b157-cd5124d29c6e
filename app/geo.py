@@ -53,8 +53,71 @@ def _check_wgs84_range(geojson: dict) -> None:
     walk(geojson.get("coordinates", []))
 
 
+def validate_crs(payload: dict) -> None:
+    """校验 FeatureCollection 头部的 crs（仅允许 WGS84/EPSG:4326/CRS84）。"""
+    crs = payload.get("crs")
+    if crs is not None:
+        name = ""
+        if isinstance(crs, dict):
+            name = str(crs.get("properties", {}).get("name", ""))
+        if name and ("4326" not in name and "CRS84" not in name.upper()):
+            raise GeoValidationError(f"仅支持 WGS84 (EPSG:4326)，收到 crs={name}")
+
+
+def validate_feature(feature: object, index: int) -> tuple[str, BaseGeometry]:
+    """校验单个 GeoJSON Feature，返回 (township_id, shapely_geometry)。
+
+    沿用整版校验的字段与拒收规则：要素类型、乡镇号字段（township_code
+    优先，其次 code）、几何类型、WGS84 范围、可解析性、有效性与非零面积。
+    乡镇号“整版内唯一性”由暂存层唯一约束负责（见 db.stage_feature）。
+    """
+    if not isinstance(feature, dict) or feature.get("type") != "Feature":
+        raise GeoValidationError(f"第 {index} 个要素不是合法 GeoJSON Feature")
+    props = feature.get("properties") or {}
+
+    raw_code = None
+    for field in config.CODE_FIELDS:
+        if field in props and props[field] is not None:
+            raw_code = props[field]
+            break
+    if raw_code is None:
+        raise GeoValidationError(
+            f"第 {index} 个要素缺少乡镇号字段（{ ' / '.join(config.CODE_FIELDS) }）"
+        )
+    township_id = str(raw_code).strip()
+    if not township_id:
+        raise GeoValidationError(f"第 {index} 个要素乡镇号为空")
+
+    geojson_geom = feature.get("geometry")
+    if not isinstance(geojson_geom, dict):
+        raise GeoValidationError(f"乡镇 {township_id} 缺少 geometry")
+    if geojson_geom.get("type") not in ALLOWED_GEOM_TYPES:
+        raise GeoValidationError(
+            f"乡镇 {township_id} 的几何类型 {geojson_geom.get('type')} 不支持，"
+            "仅允许 Polygon / MultiPolygon"
+        )
+    _check_wgs84_range(geojson_geom)
+
+    try:
+        geom = shape(geojson_geom)
+    except Exception as exc:  # shapely 解析失败
+        raise GeoValidationError(f"乡镇 {township_id} 几何无法解析：{exc}") from exc
+
+    if geom.is_empty:
+        raise GeoValidationError(f"乡镇 {township_id} 几何为空")
+    if not geom.is_valid:
+        raise GeoValidationError(
+            f"乡镇 {township_id} 几何无效（自交/环未闭合等），"
+            f"原因：{is_valid_reason(geom)}"
+        )
+    if geom.area <= 0:
+        raise GeoValidationError(f"乡镇 {township_id} 面面积为 0")
+
+    return township_id, geom
+
+
 def parse_feature_collection(payload: dict) -> list[tuple[str, BaseGeometry]]:
-    """解析并整版校验 FeatureCollection。
+    """解析并整版校验 FeatureCollection（全量 dict 输入的便捷封装）。
 
     返回 [(township_id, shapely_geometry), ...]；
     任一要素无效、乡镇号缺失/重复、几何非面或面积为 0 均抛 GeoValidationError，
@@ -65,13 +128,7 @@ def parse_feature_collection(payload: dict) -> list[tuple[str, BaseGeometry]]:
     if payload.get("type") != "FeatureCollection":
         raise GeoValidationError("仅支持 GeoJSON FeatureCollection")
 
-    crs = payload.get("crs")
-    if crs is not None:
-        name = ""
-        if isinstance(crs, dict):
-            name = str(crs.get("properties", {}).get("name", ""))
-        if name and ("4326" not in name and "CRS84" not in name.upper()):
-            raise GeoValidationError(f"仅支持 WGS84 (EPSG:4326)，收到 crs={name}")
+    validate_crs(payload)
 
     features = payload.get("features")
     if not isinstance(features, list) or not features:
@@ -81,54 +138,18 @@ def parse_feature_collection(payload: dict) -> list[tuple[str, BaseGeometry]]:
     parsed: list[tuple[str, BaseGeometry]] = []
 
     for idx, feature in enumerate(features):
-        if not isinstance(feature, dict) or feature.get("type") != "Feature":
-            raise GeoValidationError(f"第 {idx} 个要素不是合法 GeoJSON Feature")
-        props = feature.get("properties") or {}
-
-        raw_code = None
-        for field in config.CODE_FIELDS:
-            if field in props and props[field] is not None:
-                raw_code = props[field]
-                break
-        if raw_code is None:
-            raise GeoValidationError(
-                f"第 {idx} 个要素缺少乡镇号字段（{ ' / '.join(config.CODE_FIELDS) }）"
-            )
-        township_id = str(raw_code).strip()
-        if not township_id:
-            raise GeoValidationError(f"第 {idx} 个要素乡镇号为空")
+        township_id, geom = validate_feature(feature, idx)
         if township_id in seen_ids:
             raise GeoValidationError(f"乡镇号重复：{township_id}")
         seen_ids.add(township_id)
-
-        geojson_geom = feature.get("geometry")
-        if not isinstance(geojson_geom, dict):
-            raise GeoValidationError(f"乡镇 {township_id} 缺少 geometry")
-        if geojson_geom.get("type") not in ALLOWED_GEOM_TYPES:
-            raise GeoValidationError(
-                f"乡镇 {township_id} 的几何类型 {geojson_geom.get('type')} 不支持，"
-                "仅允许 Polygon / MultiPolygon"
-            )
-        _check_wgs84_range(geojson_geom)
-
-        try:
-            geom = shape(geojson_geom)
-        except Exception as exc:  # shapely 解析失败
-            raise GeoValidationError(f"乡镇 {township_id} 几何无法解析：{exc}") from exc
-
-        if geom.is_empty:
-            raise GeoValidationError(f"乡镇 {township_id} 几何为空")
-        if not geom.is_valid:
-            raise GeoValidationError(
-                f"乡镇 {township_id} 几何无效（自交/环未闭合等），"
-                f"原因：{is_valid_reason(geom)}"
-            )
-        if geom.area <= 0:
-            raise GeoValidationError(f"乡镇 {township_id} 面面积为 0")
-
         parsed.append((township_id, geom))
 
     return parsed
+
+
+def to_storage_geometry(geom: BaseGeometry) -> dict:
+    """把单个 Shapely 几何转回 GeoJSON dict 以便入库。"""
+    return mapping(geom)
 
 
 def to_storage_geometries(
@@ -376,6 +397,9 @@ __all__ = [
     "load_and_project",
     "parse_feature_collection",
     "project_geoms",
+    "to_storage_geometry",
     "to_storage_geometries",
     "union_area",
+    "validate_crs",
+    "validate_feature",
 ]
